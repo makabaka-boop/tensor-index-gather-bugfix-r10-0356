@@ -100,6 +100,53 @@ test("POST /compute 拒绝非法常量 (400)；JSON 中 NaN 会被序列化为 n
   assert.equal(json.error.code, "NON_FINITE_VALUE");
 });
 
+test("gather 端到端：取值顺序、重复索引梯度累加", async () => {
+  const { status, json } = await post({
+    nodes: [
+      {
+        id: "X",
+        op: "const",
+        value: [
+          [1, 2, 3],
+          [4, 5, 6],
+        ],
+      },
+      { id: "g", op: "gather", inputs: ["X"], axis: -1, indices: [2, 2, 0] },
+      { id: "f", op: "sum", inputs: ["g"] },
+    ],
+    outputs: ["g", "f"],
+    gradInputs: ["X"],
+  });
+  assert.equal(status, 200);
+  assert.deepEqual(json.outputs, [
+    [
+      [3, 3, 1],
+      [6, 6, 4],
+    ],
+    23,
+  ]);
+  // g 与 f 都是输出（各一份全 1 种子，两份相同）：列 2 每格 4、列 0 每格 2
+  assert.deepEqual(json.grads.X, [
+    [2, 0, 4],
+    [2, 0, 4],
+  ]);
+});
+
+test("gather 非法索引返回 400 且无部分结果", async () => {
+  const { status, json } = await post({
+    nodes: [
+      { id: "x", op: "const", value: [1, 2, 3] },
+      { id: "g", op: "gather", inputs: ["x"], indices: [5] },
+    ],
+    outputs: ["g"],
+    gradInputs: ["x"],
+  });
+  assert.equal(status, 400);
+  assert.equal(json.error.code, "INVALID_REQUEST");
+  assert.equal(json.outputs, undefined);
+  assert.equal(json.grads, undefined);
+});
+
 test("GET /health", async () => {
   const res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);

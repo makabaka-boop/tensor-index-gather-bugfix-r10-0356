@@ -1,4 +1,8 @@
-import { gatherShape } from "./gather.js";
+import {
+  gatherShape,
+  normalizeAxis,
+  validateGatherFields,
+} from "./gather.js";
 import { GraphError } from "./errors.js";
 import {
   Tensor,
@@ -40,6 +44,10 @@ export interface PreparedNode {
   constant: Tensor | null;
   /** 拓扑序中的位置 */
   topoIndex: number;
+  /** gather：结构校验后的 indices（结构校验阶段填充） */
+  gatherIndices?: number[];
+  /** gather：按输入秩归一后的 axis（形状推断阶段填充） */
+  gatherAxis?: 0 | 1;
 }
 
 export interface PreparedGraph {
@@ -109,6 +117,7 @@ export function prepareGraph(req: unknown): PreparedGraph {
     }
 
     let constant: Tensor | null = null;
+    let gatherIndices: number[] | undefined;
     switch (spec.op) {
       case "const":
         if (spec.inputs !== undefined) {
@@ -143,6 +152,19 @@ export function prepareGraph(req: unknown): PreparedGraph {
         }
         break;
       case "gather":
+        if (!Array.isArray(spec.inputs) || spec.inputs.length !== 1) {
+          throw new GraphError(
+            "INVALID_REQUEST",
+            `节点 ${spec.id} (gather) 需要恰好 1 个输入`,
+          );
+        }
+        // axis / indices 结构校验（越界检查在形状推断、输入形状已知后进行）
+        gatherIndices = validateGatherFields(
+          spec.id,
+          spec.axis,
+          spec.indices,
+        ).indices;
+        break;
       case "sum":
       case "relu":
         if (!Array.isArray(spec.inputs) || spec.inputs.length !== 1) {
@@ -165,6 +187,7 @@ export function prepareGraph(req: unknown): PreparedGraph {
       inputNodes: [],
       constant,
       topoIndex: -1,
+      ...(gatherIndices !== undefined ? { gatherIndices } : {}),
     });
   }
 
@@ -271,13 +294,19 @@ export function prepareGraph(req: unknown): PreparedGraph {
         node.shape = inferMatmulShape(a.shape, b.shape, node.spec.id);
         break;
       }
-      case "gather":
+      case "gather": {
+        const axisRaw = node.spec.axis ?? 0;
+        const inputShape = node.inputNodes[0].shape;
+        // gatherShape 内部完成秩 / 越界 / 负轴归一校验；
+        // 归一后的 axis 存到 PreparedNode，供前向与反向直接使用（此时已全部验证通过）。
         node.shape = gatherShape(
-          node.inputNodes[0].shape,
-          node.spec.axis,
-          node.spec.indices,
+          inputShape,
+          axisRaw,
+          node.gatherIndices as number[],
         );
+        node.gatherAxis = normalizeAxis(axisRaw, inputShape.length);
         break;
+      }
       case "sum":
         node.shape = [];
         break;

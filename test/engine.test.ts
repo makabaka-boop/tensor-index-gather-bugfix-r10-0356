@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { compute } from "../src/engine.js";
 import { GraphError } from "../src/errors.js";
 import { MAX_NODES } from "../src/graph.js";
-import type { NodeSpec, TensorValue } from "../src/graph.js";
+import type { ComputeRequest, NodeSpec, TensorValue } from "../src/graph.js";
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -751,6 +751,438 @@ test("失败时不返回部分梯度（反向阶段产生非有限值整体失�
 });
 
 // ---------------------------------------------------------------------------
+// gather：索引采样（取值顺序 / 重复索引 / 正负轴 / 推断形状）
+// ---------------------------------------------------------------------------
+
+test("gather 前向：一维按 indices 顺序采样，重复索引重复取值", () => {
+  const res = compute({
+    nodes: [
+      { id: "x", op: "const", value: [10, 20, 30] },
+      { id: "g", op: "gather", inputs: ["x"], indices: [2, 0, 2, 1] },
+    ],
+    outputs: ["g"],
+  });
+  assert.deepEqual(res.outputs, [[30, 10, 30, 20]]);
+});
+
+test("gather 前向：二维 axis=0 取整行（含重复行）", () => {
+  const res = compute({
+    nodes: [
+      {
+        id: "M",
+        op: "const",
+        value: [
+          [1, 2, 3],
+          [4, 5, 6],
+          [7, 8, 9],
+        ],
+      },
+      { id: "g", op: "gather", inputs: ["M"], axis: 0, indices: [2, 2, 0] },
+    ],
+    outputs: ["g"],
+  });
+  assert.deepEqual(res.outputs[0], [
+    [7, 8, 9],
+    [7, 8, 9],
+    [1, 2, 3],
+  ]);
+});
+
+test("gather 前向：二维 axis=1 取列，axis 缺省为 0", () => {
+  const res = compute({
+    nodes: [
+      {
+        id: "M",
+        op: "const",
+        value: [
+          [1, 2, 3],
+          [4, 5, 6],
+        ],
+      },
+      { id: "g1", op: "gather", inputs: ["M"], axis: 1, indices: [2, 0, 2] },
+      { id: "g0", op: "gather", inputs: ["M"], indices: [1, 0] },
+    ],
+    outputs: ["g1", "g0"],
+  });
+  assert.deepEqual(res.outputs[0], [
+    [3, 1, 3],
+    [6, 4, 6],
+  ]);
+  assert.deepEqual(res.outputs[1], [
+    [4, 5, 6],
+    [1, 2, 3],
+  ]);
+});
+
+test("gather 前向：负轴按秩归一（-1 为最后一维，-2 为第一维）", () => {
+  const res = compute({
+    nodes: [
+      {
+        id: "M",
+        op: "const",
+        value: [
+          [1, 2, 3],
+          [4, 5, 6],
+        ],
+      },
+      { id: "g1", op: "gather", inputs: ["M"], axis: -1, indices: [1, 1] },
+      { id: "g0", op: "gather", inputs: ["M"], axis: -2, indices: [1] },
+    ],
+    outputs: ["g1", "g0"],
+  });
+  assert.deepEqual(res.outputs[0], [
+    [2, 2],
+    [5, 5],
+  ]);
+  assert.deepEqual(res.outputs[1], [[4, 5, 6]]);
+});
+
+test("gather 前向：结果送入广播、矩阵乘与求和的全链路", () => {
+  const res = compute({
+    nodes: [
+      {
+        id: "X",
+        op: "const",
+        value: [
+          [1, 2],
+          [3, 4],
+          [5, 6],
+        ],
+      },
+      {
+        id: "W",
+        op: "const",
+        value: [
+          [7, 8, 9],
+          [10, 11, 12],
+        ],
+      },
+      { id: "G", op: "gather", inputs: ["X"], axis: 0, indices: [1, 1, 0] },
+      { id: "b", op: "const", value: [1, 2, 3] },
+      { id: "H", op: "matmul", inputs: ["G", "W"] },
+      { id: "Y", op: "add", inputs: ["H", "b"] },
+      { id: "f", op: "sum", inputs: ["Y"] },
+    ],
+    outputs: ["G", "H", "Y", "f"],
+  });
+  assert.deepEqual(res.outputs[0], [
+    [3, 4],
+    [3, 4],
+    [1, 2],
+  ]);
+  assert.deepEqual(res.outputs[1], [
+    [61, 68, 75],
+    [61, 68, 75],
+    [27, 30, 33],
+  ]);
+  assert.deepEqual(res.outputs[2], [
+    [62, 70, 78],
+    [62, 70, 78],
+    [28, 32, 36],
+  ]);
+  assert.equal(res.outputs[3], 516);
+});
+
+test("gather 反向：一维重复索引的贡献累加回原位置", () => {
+  const res = compute({
+    nodes: [
+      { id: "x", op: "const", value: [10, 20, 30] },
+      { id: "g", op: "gather", inputs: ["x"], indices: [2, 0, 2, 1] },
+      { id: "f", op: "sum", inputs: ["g"] },
+    ],
+    outputs: ["f"],
+    gradInputs: ["x"],
+  });
+  assert.deepEqual(res.grads.x, [1, 1, 2]);
+});
+
+test("gather 反向：二维 axis=0 整行散射，重复行逐元素累加", () => {
+  const res = compute({
+    nodes: [
+      {
+        id: "M",
+        op: "const",
+        value: [
+          [1, 2, 3],
+          [4, 5, 6],
+          [7, 8, 9],
+        ],
+      },
+      { id: "g", op: "gather", inputs: ["M"], axis: 0, indices: [2, 2, 0] },
+      { id: "f", op: "sum", inputs: ["g"] },
+    ],
+    outputs: ["f"],
+    gradInputs: ["M"],
+  });
+  assert.deepEqual(res.grads.M, [
+    [1, 1, 1],
+    [0, 0, 0],
+    [2, 2, 2],
+  ]);
+});
+
+test("gather 反向：二维 axis=1（含负轴）按列累加", () => {
+  const nodes: NodeSpec[] = [
+    {
+      id: "M",
+      op: "const",
+      value: [
+        [1, 2, 3],
+        [4, 5, 6],
+      ],
+    },
+    { id: "g", op: "gather", inputs: ["M"], axis: 1, indices: [2, 0, 2] },
+    { id: "f", op: "sum", inputs: ["g"] },
+  ];
+  const res = compute({ nodes, outputs: ["f"], gradInputs: ["M"] });
+  assert.deepEqual(res.grads.M, [
+    [1, 0, 2],
+    [1, 0, 2],
+  ]);
+  const negNodes: NodeSpec[] = [
+    {
+      id: "M",
+      op: "const",
+      value: [
+        [1, 2, 3],
+        [4, 5, 6],
+      ],
+    },
+    { id: "g", op: "gather", inputs: ["M"], axis: -1, indices: [1, 1, 0] },
+    { id: "f", op: "sum", inputs: ["g"] },
+  ];
+  const neg = compute({ nodes: negNodes, outputs: ["f"], gradInputs: ["M"] });
+  assert.deepEqual(neg.grads.M, [
+    [1, 2, 0],
+    [1, 2, 0],
+  ]);
+});
+
+test("gather 反向：同一 gather 被两个共享分支使用，梯度累加全部路径", () => {
+  // g = [x3, x3, x1]
+  // s1 = sum(g) = 2*x3 + x1
+  // p = g[3] * M[3,1]：尾部对齐后 g 对齐列维，p[i,j] = g[j]*M[i,0]
+  //   M 列和 = 1+2+1 = 4 => s2 回传给 g 的梯度为 [4,4,4]
+  // 单输出 f = s1 + s2：g 梯度 [5,5,5]，按 [3,3,1] 散射 => dx1 = 5, dx3 = 10
+  const nodes: NodeSpec[] = [
+    { id: "x", op: "const", value: [1.1, 2.2, 3.3, 4.4] },
+    { id: "g", op: "gather", inputs: ["x"], indices: [3, 3, 1] },
+    { id: "s1", op: "sum", inputs: ["g"] },
+    { id: "M", op: "const", value: [[1], [2], [1]] },
+    { id: "p", op: "mul", inputs: ["g", "M"] },
+    { id: "s2", op: "sum", inputs: ["p"] },
+    { id: "f", op: "add", inputs: ["s1", "s2"] },
+  ];
+  const single = compute({ nodes, outputs: ["f"], gradInputs: ["x", "M"] });
+  assert.deepEqual(single.grads.x, [0, 5, 0, 10]);
+  checkGradsWithFD(nodes, "f", ["x", "M"], 1e-5);
+
+  // 多输出 ["g","f"]：g 自身也是输出，其全 1 种子散射再贡献 x3 +2、x1 +1
+  const multi = compute({
+    nodes,
+    outputs: ["g", "f"],
+    gradInputs: ["x"],
+  });
+  assert.deepEqual(multi.grads.x, [0, 6, 0, 12]);
+});
+
+test("gather 反向：同一输入被两个 gather 采样，贡献在常量叶子上累加", () => {
+  const nodes: NodeSpec[] = [
+    { id: "x", op: "const", value: [1.1, 2.2, 3.3] },
+    { id: "g1", op: "gather", inputs: ["x"], indices: [0, 0] },
+    { id: "g2", op: "gather", inputs: ["x"], indices: [2, 1, 2] },
+    { id: "s1", op: "sum", inputs: ["g1"] },
+    { id: "s2", op: "sum", inputs: ["g2"] },
+    { id: "f", op: "add", inputs: ["s1", "s2"] },
+  ];
+  const res = compute({ nodes, outputs: ["f"], gradInputs: ["x"] });
+  assert.deepEqual(res.grads.x, [2, 1, 2]);
+  checkGradsWithFD(nodes, "f", ["x"]);
+});
+
+test("gather 全链路梯度：行采样 -> 矩阵乘 -> 广播加（有限差分）", () => {
+  const nodes: NodeSpec[] = [
+    {
+      id: "X",
+      op: "const",
+      value: [
+        [1, 2],
+        [3, 4],
+        [5, 6],
+      ],
+    },
+    {
+      id: "W",
+      op: "const",
+      value: [
+        [7, 8, 9],
+        [10, 11, 12],
+      ],
+    },
+    { id: "G", op: "gather", inputs: ["X"], axis: 0, indices: [1, 1, 0] },
+    { id: "b", op: "const", value: [1, 2, 3] },
+    { id: "H", op: "matmul", inputs: ["G", "W"] },
+    { id: "Y", op: "add", inputs: ["H", "b"] },
+    { id: "f", op: "sum", inputs: ["Y"] },
+  ];
+  checkGradsWithFD(nodes, "f", ["X", "W", "b"]);
+});
+
+test("gather 全链路梯度：axis=1 列采样后接广播乘 + ReLU（有限差分）", () => {
+  const nodes: NodeSpec[] = [
+    {
+      id: "X",
+      op: "const",
+      value: [
+        [1, 2, -3],
+        [4, -5, 6],
+      ],
+    },
+    { id: "g", op: "gather", inputs: ["X"], axis: 1, indices: [2, 0, 2, 1] },
+    { id: "R", op: "relu", inputs: ["g"] },
+    { id: "f", op: "sum", inputs: ["R"] },
+  ];
+  checkGradsWithFD(nodes, "f", ["X"]);
+});
+
+test("gather：非法索引 / 轴 / indices 形状在执行前失败", () => {
+  const gatherReq = (
+    value: TensorValue,
+    extra: Record<string, unknown>,
+  ): ComputeRequest => ({
+    nodes: [
+      { id: "x", op: "const", value },
+      { id: "g", op: "gather", inputs: ["x"], ...extra } as NodeSpec,
+    ],
+    outputs: ["g"],
+  });
+
+  // 越界（按所选轴长度判定，含负轴归一后）
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { indices: [3] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([[1, 2], [3, 4]], { indices: [2] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([[1, 2], [3, 4]], { axis: 1, indices: [2] })),
+  );
+  // 负索引不合法（只有负轴允许）
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { indices: [-1] })),
+  );
+  // indices 必须非空、至多 128 项、元素为非负整数
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { indices: [] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], {})),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { indices: [1.5] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { indices: ["1"] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(
+      gatherReq([1, 2, 3], {
+        indices: Array.from({ length: 129 }, () => 0),
+      }),
+    ),
+  );
+  // axis 必须是整数且归一后不越界
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { axis: 0.5, indices: [0] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { axis: "0", indices: [0] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { axis: 1, indices: [0] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([1, 2, 3], { axis: -2, indices: [0] })),
+  );
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq([[1, 2], [3, 4]], { axis: 2, indices: [0] })),
+  );
+  // 标量输入不能 gather
+  expectGraphError("INVALID_REQUEST", () =>
+    compute(gatherReq(5, { indices: [0] })),
+  );
+
+  // 恰好 128 项合法
+  assert.doesNotThrow(() =>
+    compute(
+      gatherReq([1, 2, 3], {
+        indices: Array.from({ length: 128 }, () => 1),
+      }),
+    ),
+  );
+});
+
+test("gather：输出形状参与元素预算，超限在分配前失败且无部分结果", () => {
+  // x 3 个元素 + gather 4 个元素 = 7
+  expectGraphError("ELEMENT_LIMIT", () =>
+    compute({
+      nodes: [
+        { id: "x", op: "const", value: [1, 2, 3] },
+        { id: "g", op: "gather", inputs: ["x"], indices: [0, 0, 0, 0] },
+      ],
+      outputs: ["g"],
+      maxElements: 6,
+    }),
+  );
+  // 预算恰好通过
+  assert.deepEqual(
+    compute({
+      nodes: [
+        { id: "x", op: "const", value: [1, 2, 3] },
+        { id: "g", op: "gather", inputs: ["x"], indices: [0, 0, 0, 0] },
+      ],
+      outputs: ["g"],
+      maxElements: 7,
+    }).outputs,
+    [[1, 1, 1, 1]],
+  );
+});
+
+test("gather：修改输入常量后重新求值，输出与梯度随之更新且不污染旧结果", () => {
+  const nodes: NodeSpec[] = [
+    { id: "x", op: "const", value: [10, 20, 30] },
+    { id: "g", op: "gather", inputs: ["x"], indices: [0, 2, 2, 1] },
+    { id: "f", op: "sum", inputs: ["g"] },
+  ];
+  const r1 = compute({ nodes, outputs: ["g", "f"], gradInputs: ["x"] });
+  assert.deepEqual(r1.outputs, [[10, 30, 30, 20], 90]);
+  // 输出含 g 与 f：两者均注入全 1 种子，故 x 各被采位置多一份贡献
+  assert.deepEqual(r1.grads.x, [2, 2, 4]);
+
+  // 单输出 f：仅一条种子，dx = [1,1,2]
+  const s1 = compute({ nodes, outputs: ["f"], gradInputs: ["x"] });
+  assert.equal(s1.outputs[0], 90);
+  assert.deepEqual(s1.grads.x, [1, 1, 2]);
+
+  const updated = nodes.map((n) =>
+    n.id === "x" ? { ...n, value: [100, 200, 300] } : n,
+  );
+  const r2 = compute({
+    nodes: updated,
+    outputs: ["g", "f"],
+    gradInputs: ["x"],
+  });
+  assert.deepEqual(r2.outputs, [[100, 300, 300, 200], 900]);
+  assert.deepEqual(r2.grads.x, [2, 2, 4]);
+
+  // 旧响应保持旧证据，不受第二次计算影响
+  assert.deepEqual(r1.outputs, [[10, 30, 30, 20], 90]);
+  assert.deepEqual(r1.grads.x, [2, 2, 4]);
+  assert.equal(s1.outputs[0], 90);
+  assert.deepEqual(s1.grads.x, [1, 1, 2]);
+});
+
+// ---------------------------------------------------------------------------
 // 随机图 fuzz：有限差分
 // ---------------------------------------------------------------------------
 
@@ -927,4 +1359,174 @@ test("fuzz：随机图前向两次计算结果一致（无共享状态）", () =
   const r1 = compute({ nodes, outputs: [outputId] });
   const r2 = compute({ nodes, outputs: [outputId] });
   assert.deepEqual(r1.outputs, r2.outputs);
+});
+
+/**
+ * 构造以 gather 为核心的随机合法图：
+ * - 叶子均为正初值的一维/二维张量（ReLU 不碰零点）
+ * - gather 轴合法、索引可重复；结果再送入广播 / matmul / sum / relu / gather
+ */
+function buildGatherGraph(seed: number): {
+  nodes: NodeSpec[];
+  outputId: string;
+  leafIds: string[];
+} {
+  const rng = makeRng(seed + 7919);
+  const shapes: number[][] = [[3], [4], [2, 3], [3, 2], [4, 2]];
+  const nodes: NodeSpec[] = [];
+  const pool: PoolEntry[] = [];
+  const leafIds: string[] = [];
+  let counter = 0;
+  const freshId = (prefix: string) => `${prefix}${counter++}`;
+
+  const addConst = (shape: number[]): PoolEntry => {
+    const id = freshId("c");
+    const total = shape.reduce((a, b) => a * b, 1);
+    const flat = Array.from({ length: total }, () => 0.3 + rng() * 0.9);
+    let value: TensorValue;
+    if (shape.length === 1) value = flat;
+    else {
+      const rows: number[][] = [];
+      for (let i = 0; i < shape[0]; i++) {
+        rows.push(flat.slice(i * shape[1], (i + 1) * shape[1]));
+      }
+      value = rows;
+    }
+    nodes.push({ id, op: "const", value });
+    const entry = { id, shape, isConst: true };
+    pool.push(entry);
+    leafIds.push(id);
+    return entry;
+  };
+
+  for (const s of shapes) addConst(s);
+
+  const canBroadcast = (a: number[], b: number[]): boolean => {
+    const rank = Math.max(a.length, b.length);
+    for (let k = 0; k < rank; k++) {
+      const da = k < rank - a.length ? 1 : a[k - (rank - a.length)];
+      const db = k < rank - b.length ? 1 : b[k - (rank - b.length)];
+      if (da !== db && da !== 1 && db !== 1) return false;
+    }
+    return true;
+  };
+
+  const pick = <T,>(arr: T[]): T => arr[Math.floor(rng() * arr.length)];
+
+  const internal = 7 + Math.floor(rng() * 6);
+  for (let s = 0; s < internal && nodes.length < 60; s++) {
+    const roll = rng();
+    if (roll < 0.4) {
+      // gather（重复索引）
+      const sources = pool.filter((p) => p.shape.length >= 1);
+      const src = pick(sources);
+      const axis = src.shape.length === 1 ? 0 : rng() < 0.5 ? 0 : 1;
+      const dim = src.shape[axis] as number;
+      const k = 1 + Math.floor(rng() * 5);
+      const indices = Array.from({ length: k }, () =>
+        Math.floor(rng() * dim),
+      );
+      const id = freshId("g");
+      nodes.push({ id, op: "gather", inputs: [src.id], axis, indices });
+      const shape = src.shape.slice();
+      shape[axis] = k;
+      pool.push({ id, shape, isConst: false });
+    } else if (roll < 0.55) {
+      const a = pick(pool);
+      const id = freshId("n");
+      nodes.push({ id, op: "relu", inputs: [a.id] });
+      pool.push({ id, shape: a.shape, isConst: false });
+    } else if (roll < 0.65) {
+      const a = pick(pool);
+      const id = freshId("n");
+      nodes.push({ id, op: "sum", inputs: [a.id] });
+      pool.push({ id, shape: [], isConst: false });
+    } else if (roll < 0.8) {
+      const lefts = pool.filter((p) => p.shape.length === 2);
+      if (lefts.length === 0) {
+        s--;
+        continue;
+      }
+      const a = pick(lefts);
+      const rights = pool.filter(
+        (p) => p.shape.length === 2 && p.shape[0] === a.shape[1],
+      );
+      if (rights.length === 0) {
+        addConst([a.shape[1], 1 + Math.floor(rng() * 3)]);
+        s--;
+        continue;
+      }
+      const b = pick(rights);
+      const id = freshId("n");
+      nodes.push({ id, op: "matmul", inputs: [a.id, b.id] });
+      pool.push({ id, shape: [a.shape[0], b.shape[1]], isConst: false });
+    } else {
+      let a: PoolEntry | null = null;
+      let b: PoolEntry | null = null;
+      for (let tries = 0; tries < 30; tries++) {
+        const ca = pick(pool);
+        const cb = pick(pool);
+        if (canBroadcast(ca.shape, cb.shape)) {
+          a = ca;
+          b = cb;
+          break;
+        }
+      }
+      if (!a || !b) {
+        s--;
+        continue;
+      }
+      const rank = Math.max(a.shape.length, b.shape.length);
+      const outShape: number[] = [];
+      for (let k = 0; k < rank; k++) {
+        const da = k < rank - a.shape.length ? 1 : a.shape[k - (rank - a.shape.length)];
+        const db = k < rank - b.shape.length ? 1 : b.shape[k - (rank - b.shape.length)];
+        outShape.push(Math.max(da, db));
+      }
+      const id = freshId("n");
+      nodes.push({
+        id,
+        op: rng() < 0.5 ? "add" : "mul",
+        inputs: [a.id, b.id],
+      });
+      pool.push({ id, shape: outShape, isConst: false });
+    }
+  }
+
+  const outputId = pool[pool.length - 1].id;
+  return { nodes, outputId, leafIds };
+}
+
+test("fuzz：100 个含 gather 的随机图，前向与梯度和有限差分一致", () => {
+  for (let seed = 1; seed <= 100; seed++) {
+    const { nodes, outputId, leafIds } = buildGatherGraph(seed);
+    const chosen = leafIds.slice(0, 3);
+    assert.doesNotThrow(
+      () => checkGradsWithFD(nodes, outputId, chosen, 1e-4),
+      `含 gather 的随机图 seed=${seed} 梯度校验失败`,
+    );
+  }
+});
+
+test("fuzz：含 gather 的图重复计算 / 改输入重算结果确定", () => {
+  const { nodes, outputId, leafIds } = buildGatherGraph(123);
+  const r1 = compute({ nodes, outputs: [outputId], gradInputs: leafIds });
+  const r2 = compute({ nodes, outputs: [outputId], gradInputs: leafIds });
+  assert.deepEqual(r1.outputs, r2.outputs);
+  assert.deepEqual(r1.grads, r2.grads);
+
+  const bumped = nodes.map((n) =>
+    n.id === leafIds[0]
+      ? {
+          ...n,
+          value: unflatten(
+            flatten(n.value as TensorValue).map((x) => x + 0.125),
+            shapeOf(n.value as TensorValue),
+          ),
+        }
+      : n,
+  );
+  assert.doesNotThrow(() =>
+    checkGradsWithFD(bumped, outputId, leafIds.slice(0, 2), 1e-4),
+  );
 });

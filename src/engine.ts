@@ -98,8 +98,8 @@ function evalNode(
     case "gather":
       return gatherValue(
         values.get(in0) as Tensor,
-        node.spec.axis ?? 0,
-        node.spec.indices!,
+        node.gatherAxis ?? 0,
+        node.gatherIndices as number[],
       );
     case "sum":
       return forwardSum(values.get(in0) as Tensor);
@@ -285,7 +285,12 @@ function backwardNode(
       addGrad(
         grads,
         aNode,
-        gatherGradient(a!, node.spec.axis ?? 0, node.spec.indices!, g),
+        gatherGradient(
+          a!,
+          node.gatherAxis ?? 0,
+          node.gatherIndices as number[],
+          g,
+        ),
       );
       return;
     case "add":
