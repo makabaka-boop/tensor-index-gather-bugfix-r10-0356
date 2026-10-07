@@ -100,6 +100,60 @@ test("POST /compute 拒绝非法常量 (400)；JSON 中 NaN 会被序列化为 n
   assert.equal(json.error.code, "NON_FINITE_VALUE");
 });
 
+test("POST /compute gather 端到端：采样 + 重复索引梯度", async () => {
+  const { status, json } = await post({
+    nodes: [
+      {
+        id: "M",
+        op: "const",
+        value: [
+          [1, 2, 3],
+          [4, 5, 6],
+          [7, 8, 9],
+        ],
+      },
+      {
+        id: "g",
+        op: "gather",
+        inputs: ["M"],
+        axis: -1,
+        indices: [2, 0, 2],
+      },
+      { id: "s", op: "sum", inputs: ["g"] },
+    ],
+    outputs: ["g", "s"],
+    gradInputs: ["M"],
+  });
+  assert.equal(status, 200);
+  assert.deepEqual(json.outputs[0], [
+    [3, 1, 3],
+    [6, 4, 6],
+    [9, 7, 9],
+  ]);
+  assert.equal(json.outputs[1], 48);
+  // 两个输出 g、s 各贡献一份全 1 种子梯度：列 2 被采两次
+  assert.deepEqual(json.grads.M, [
+    [2, 0, 4],
+    [2, 0, 4],
+    [2, 0, 4],
+  ]);
+});
+
+test("POST /compute gather 非法索引返回 400 且无部分结果", async () => {
+  const { status, json } = await post({
+    nodes: [
+      { id: "v", op: "const", value: [1, 2, 3] },
+      { id: "g", op: "gather", inputs: ["v"], indices: [0, 9] },
+    ],
+    outputs: ["g"],
+    gradInputs: ["v"],
+  });
+  assert.equal(status, 400);
+  assert.equal(json.error.code, "INVALID_REQUEST");
+  assert.equal(json.outputs, undefined);
+  assert.equal(json.grads, undefined);
+});
+
 test("GET /health", async () => {
   const res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);

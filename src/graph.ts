@@ -1,4 +1,8 @@
-import { gatherShape } from "./gather.js";
+import {
+  prepareGather,
+  gatherShape,
+  type GatherParams,
+} from "./gather.js";
 import { GraphError } from "./errors.js";
 import {
   Tensor,
@@ -38,6 +42,8 @@ export interface PreparedNode {
   shape: number[];
   inputNodes: PreparedNode[];
   constant: Tensor | null;
+  /** gather 节点校验归一化后的静态参数（其余算子为 null） */
+  gatherParams: GatherParams | null;
   /** 拓扑序中的位置 */
   topoIndex: number;
 }
@@ -164,6 +170,7 @@ export function prepareGraph(req: unknown): PreparedGraph {
       shape: [],
       inputNodes: [],
       constant,
+      gatherParams: null,
       topoIndex: -1,
     });
   }
@@ -271,13 +278,20 @@ export function prepareGraph(req: unknown): PreparedGraph {
         node.shape = inferMatmulShape(a.shape, b.shape, node.spec.id);
         break;
       }
-      case "gather":
-        node.shape = gatherShape(
-          node.inputNodes[0].shape,
+      case "gather": {
+        const src = node.inputNodes[0] as PreparedNode;
+        // 全部非法情形（秩、轴、索引类型/范围/上限）在此处失败，
+        // 早于元素预算检查与任何前向缓冲区分配。
+        const params = prepareGather(
+          node.spec.id,
+          src.shape,
           node.spec.axis,
           node.spec.indices,
         );
+        node.gatherParams = params;
+        node.shape = gatherShape(src.shape, params);
         break;
+      }
       case "sum":
         node.shape = [];
         break;

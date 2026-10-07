@@ -1,4 +1,8 @@
-import { gatherValue, gatherGradient } from "./gather.js";
+import {
+  gatherValue,
+  gatherGradient,
+  type GatherParams,
+} from "./gather.js";
 import { GraphError } from "./errors.js";
 import {
   prepareGraph,
@@ -98,8 +102,7 @@ function evalNode(
     case "gather":
       return gatherValue(
         values.get(in0) as Tensor,
-        node.spec.axis ?? 0,
-        node.spec.indices!,
+        node.gatherParams as GatherParams,
       );
     case "sum":
       return forwardSum(values.get(in0) as Tensor);
@@ -285,7 +288,7 @@ function backwardNode(
       addGrad(
         grads,
         aNode,
-        gatherGradient(a!, node.spec.axis ?? 0, node.spec.indices!, g),
+        gatherGradient(a!.shape, node.gatherParams as GatherParams, g),
       );
       return;
     case "add":
